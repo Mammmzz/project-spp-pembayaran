@@ -425,14 +425,49 @@ class PaymentController extends Controller
                 DB::table('tagihan')
                     ->where('id', $id)
                     ->update([
-                        'status' => 'paid', // or 'lunas'
+                        'status' => 'paid',
+                        'terbayar' => $tagihan->jumlah,
+                        'tanggal_bayar' => now(),
+                        'metode_bayar' => 'Verifikasi Petugas',
                         'updated_at' => now(),
-                        // 'verified_at' => now(),
-                        // 'verified_by' => Auth::id(),
                     ]);
                     
-                // Send notification logic here if needed
+                // Send FCM notification to user
+                $user = \App\Models\User::find($tagihan->user_id);
+                if ($user && $user->fcm_token) {
+                    try {
+                        $fcmService = new FCMService();
+                        $fcmService->sendPaymentSuccessNotification($user->fcm_token, [
+                            'id' => $tagihan->id,
+                            'bulan' => $tagihan->bulan,
+                            'tahun' => $tagihan->tahun,
+                            'jumlah' => $tagihan->jumlah,
+                            'metode_bayar' => 'Verifikasi Petugas',
+                            'tanggal_bayar' => now(),
+                        ]);
+                        logger()->info('✅ FCM notification sent for verified payment');
+                    } catch (\Exception $e) {
+                        logger()->error('❌ FCM notification failed: ' . $e->getMessage());
+                    }
+                }
                 
+                // Create in-app notification
+                DB::table('notifications')->insert([
+                    'user_id' => $tagihan->user_id,
+                    'type' => 'Pembayaran',
+                    'title' => 'Pembayaran SPP Berhasil Diverifikasi',
+                    'message' => 'Pembayaran SPP ' . $tagihan->bulan . ' ' . $tagihan->tahun . ' sebesar Rp ' . number_format($tagihan->jumlah, 0, ',', '.') . ' telah diverifikasi oleh petugas.',
+                    'data' => json_encode([
+                        'payment_id' => $tagihan->id,
+                        'bulan' => $tagihan->bulan,
+                        'tahun' => $tagihan->tahun,
+                        'jumlah' => $tagihan->jumlah,
+                    ]),
+                    'is_read' => false,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+                    
                 return response()->json([
                     'status' => true,
                     'message' => 'Payment verified successfully',
@@ -441,7 +476,7 @@ class PaymentController extends Controller
                 DB::table('tagihan')
                     ->where('id', $id)
                     ->update([
-                        'status' => 'failed', // or 'unpaid'
+                        'status' => 'failed',
                         'updated_at' => now(),
                     ]);
                     
@@ -498,6 +533,7 @@ class PaymentController extends Controller
             
             // Determine status: 'paid' if fully paid, 'partial' if partially paid
             $newStatus = ($newTerbayar >= $total) ? 'paid' : 'partial';
+            $isInstallment = $newStatus === 'partial';
 
             // Update tagihan with proper terbayar column
             DB::table('tagihan')
@@ -509,6 +545,78 @@ class PaymentController extends Controller
                     'tanggal_bayar' => now(),
                     'metode_bayar' => 'Manual (Petugas)'
                 ]);
+
+            // Save installment payment history
+            if ($amount > 0) {
+                InstallmentPayment::create([
+                    'tagihan_id' => $id,
+                    'user_id' => $tagihan->user_id,
+                    'order_id' => 'MANUAL-' . $id . '-' . time(),
+                    'amount' => $amount,
+                    'payment_method' => 'Manual (Petugas)',
+                    'status' => 'success',
+                    'transaction_id' => null,
+                    'paid_at' => now(),
+                ]);
+            }
+
+            // Send FCM notification to user
+            $user = \App\Models\User::find($tagihan->user_id);
+            if ($user && $user->fcm_token) {
+                try {
+                    $fcmService = new FCMService();
+                    
+                    // Notification title and body based on payment type
+                    $notifTitle = $newStatus === 'paid' 
+                        ? 'Pembayaran SPP Lunas' 
+                        : 'Cicilan SPP Berhasil';
+                    
+                    $notifBody = $newStatus === 'paid'
+                        ? 'Pembayaran SPP ' . $tagihan->bulan . ' ' . $tagihan->tahun . ' sebesar Rp ' . number_format($tagihan->jumlah, 0, ',', '.') . ' telah lunas.'
+                        : 'Cicilan SPP ' . $tagihan->bulan . ' ' . $tagihan->tahun . ' sebesar Rp ' . number_format($amount, 0, ',', '.') . ' berhasil. Sisa: Rp ' . number_format($newRemaining, 0, ',', '.');
+                    
+                    $fcmService->sendPaymentSuccessNotification($user->fcm_token, [
+                        'id' => $tagihan->id,
+                        'bulan' => $tagihan->bulan,
+                        'tahun' => $tagihan->tahun,
+                        'jumlah' => $amount,
+                        'metode_bayar' => 'Manual (Petugas)',
+                        'tanggal_bayar' => now(),
+                        'is_installment' => $isInstallment,
+                    ]);
+                    logger()->info('✅ FCM notification sent for manual payment');
+                } catch (\Exception $e) {
+                    logger()->error('❌ FCM notification failed: ' . $e->getMessage());
+                }
+            }
+            
+            // Create in-app notification
+            $notifTitle = $newStatus === 'paid' 
+                ? 'Pembayaran SPP Lunas' 
+                : 'Cicilan SPP Berhasil';
+            $notifMessage = $newStatus === 'paid'
+                ? 'Pembayaran SPP ' . $tagihan->bulan . ' ' . $tagihan->tahun . ' sebesar Rp ' . number_format($tagihan->jumlah, 0, ',', '.') . ' telah lunas.'
+                : 'Cicilan SPP ' . $tagihan->bulan . ' ' . $tagihan->tahun . ' sebesar Rp ' . number_format($amount, 0, ',', '.') . ' berhasil diproses oleh petugas. Sisa tagihan: Rp ' . number_format($newRemaining, 0, ',', '.');
+            
+            DB::table('notifications')->insert([
+                'user_id' => $tagihan->user_id,
+                'type' => 'Pembayaran',
+                'title' => $notifTitle,
+                'message' => $notifMessage,
+                'data' => json_encode([
+                    'payment_id' => $tagihan->id,
+                    'bulan' => $tagihan->bulan,
+                    'tahun' => $tagihan->tahun,
+                    'jumlah' => $amount,
+                    'terbayar' => $newTerbayar,
+                    'sisa' => $newRemaining,
+                    'status' => $newStatus,
+                    'is_installment' => $isInstallment,
+                ]),
+                'is_read' => false,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
 
             return response()->json([
                 'status' => true,
